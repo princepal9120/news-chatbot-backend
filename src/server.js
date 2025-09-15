@@ -1,4 +1,4 @@
-// server.js - Main Express server
+// server.js - Optimized Express server with performance fixes
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
@@ -10,7 +10,6 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { QdrantClient } = require('@qdrant/js-client-rest');
 require('dotenv').config();
 
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -18,28 +17,68 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize services
+// Performance monitoring middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (duration > 3000) {
+      console.warn(`⚠️  SLOW REQUEST: ${req.method} ${req.path} - ${duration}ms`);
+    } else if (req.path === '/api/query') {
+      console.log(`✅ Query processed in ${duration}ms`);
+    }
+  });
+  next();
+});
+
+// Initialize services with optimized configurations
 const redis = Redis.createClient({
-  url: process.env.REDIS_URL || 'redis://localhost:6379'
+  url: process.env.REDIS_URL || 'redis://localhost:6379',
+  socket: {
+    keepAlive: true,
+    reconnectDelay: 50
+  },
+  lazyConnect: true
 });
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://newsai:password@localhost:5432/newsai'
+  connectionString: process.env.DATABASE_URL || 'postgresql://newsai:password@localhost:5432/newsai',
+  max: 10, // connection pool size
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
+const model = genAI.getGenerativeModel({
+  model: 'gemini-2.5-pro',
+  generationConfig: {
+    maxOutputTokens: 1000, // Limit response length
+    temperature: 0.7
+  }
+});
 
 const qdrantClient = new QdrantClient({
   url: process.env.QDRANT_URL || 'localhost',
-  apiKey: process.env.QDRANT_API_KEY || 'your-api-key'
+  apiKey: process.env.QDRANT_API_KEY || 'your-api-key',
+  timeout: 10000
 });
 
-// News Ingestion and Embedding Service
+// Optimized News Ingestion and Embedding Service
 class NewsIngestionService {
   constructor() {
     this.collectionName = 'news_embeddings';
     this.jinaApiKey = process.env.JINA_API_KEY;
+    this.embeddingCache = new Map();
+    this.maxCacheSize = 200;
+
+    // Axios instance with optimized config
+    this.axiosInstance = axios.create({
+      timeout: 8000,
+      headers: {
+        'Authorization': `Bearer ${this.jinaApiKey}`,
+        'Content-Type': 'application/json'
+      }
+    });
   }
 
   async initializeVectorDB() {
@@ -49,7 +88,6 @@ class NewsIngestionService {
       });
       console.log('Vector collection created successfully');
     } catch (error) {
-      // Check for conflict status (409) or error message containing 'already exists'
       if (error.status === 409 ||
         error.message?.includes('already exists') ||
         error.data?.status?.error?.includes('already exists')) {
@@ -60,11 +98,9 @@ class NewsIngestionService {
     }
   }
 
-
-
   async scrapeNews() {
     const rssSources = [
-      // 🌍 World / International News
+      // World / International News
       'https://feeds.bbci.co.uk/news/world/rss.xml',
       'https://rss.cnn.com/rss/edition_world.rss',
       'https://feeds.reuters.com/reuters/worldNews',
@@ -72,14 +108,14 @@ class NewsIngestionService {
       'https://www.theguardian.com/world/rss',
       'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
 
-      // 🏛 Politics
+      // Politics
       'https://feeds.bbci.co.uk/news/politics/rss.xml',
       'https://rss.cnn.com/rss/cnn_allpolitics.rss',
       'https://www.theguardian.com/politics/rss',
       'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',
       'https://www.politico.com/rss/politics08.xml',
 
-      // 💻 Technology
+      // Technology
       'https://www.theverge.com/rss/index.xml',
       'https://feeds.arstechnica.com/arstechnica/index',
       'https://www.engadget.com/rss.xml',
@@ -90,61 +126,51 @@ class NewsIngestionService {
       'https://www.zdnet.com/news/rss.xml',
       'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml',
 
-      // 💹 Business / Finance
+      // Business / Finance
       'https://feeds.reuters.com/reuters/businessNews',
       'https://www.cnbc.com/id/100003114/device/rss/rss.html',
       'https://www.economist.com/latest/rss.xml',
       'https://www.forbes.com/business/feed2/',
       'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
-      'https://www.ft.com/?format=rss',
-      'https://www.bloomberg.com/feed/podcast/businessweek.xml',
 
-      // 🏟 Sports
+      // Sports
       'https://www.espn.com/espn/rss/news',
       'https://www.skysports.com/rss/12040',
       'https://www.bbc.com/sport/rss.xml',
       'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml',
       'https://www.cbssports.com/rss/headlines/',
 
-      // ✈ Travel
-      'https://www.nationalgeographic.com/content/nationalgeographic/en_us/travel.rss',
-      'https://www.lonelyplanet.com/news.rss',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Travel.xml',
-      'https://feeds.bbci.co.uk/news/world/asia/rss.xml', // has travel-style stories too
-
-      // 🪙 Crypto / Blockchain
+      // Crypto / Blockchain
       'https://cointelegraph.com/rss',
       'https://news.bitcoin.com/feed/',
       'https://decrypt.co/feed',
       'https://www.coindesk.com/arc/outboundfeeds/rss/',
 
-      // 🤖 Artificial Intelligence
+      // AI
       'https://spectrum.ieee.org/artificial-intelligence/fulltext/rss',
-      'https://www.technologyreview.com/feed/', // MIT Tech Review (AI heavy)
-      'https://venturebeat.com/category/ai/feed/',
-      'https://towardsdatascience.com/feed'
+      'https://www.technologyreview.com/feed/',
+      'https://venturebeat.com/category/ai/feed/'
     ];
 
     const articles = [];
-
-    for (const rssUrl of rssSources) {
-      if (articles.length >= 100) break; // increase limit for more categories
-
+    const promises = rssSources.slice(0, 15).map(async (rssUrl) => { // Limit concurrent requests
       try {
         const response = await axios.get(rssUrl, {
-          headers: { 'Accept': 'application/rss+xml, application/xml' }
+          headers: { 'Accept': 'application/rss+xml, application/xml' },
+          timeout: 5000
         });
 
         const $ = cheerio.load(response.data, { xmlMode: true });
+        const sourceArticles = [];
 
         $('item').each((i, item) => {
-          if (articles.length < 100) {
+          if (sourceArticles.length < 10) { // Limit per source
             const title = $(item).find('title').text();
             const description = $(item).find('description').text();
             const link = $(item).find('link').text();
             const pubDate = $(item).find('pubDate').text();
 
-            articles.push({
+            sourceArticles.push({
               id: uuidv4(),
               title: title.trim(),
               content: description.trim(),
@@ -154,48 +180,79 @@ class NewsIngestionService {
             });
           }
         });
+
+        return sourceArticles;
       } catch (error) {
         console.error(`Error scraping ${rssUrl}:`, error.message);
+        return [];
       }
-    }
+    });
 
-    return articles;
+    const results = await Promise.allSettled(promises);
+    results.forEach(result => {
+      if (result.status === 'fulfilled') {
+        articles.push(...result.value);
+      }
+    });
+
+    return articles.slice(0, 100); // Limit total articles
   }
 
-
-
-
+  // Optimized embedding generation with caching and batching
   async generateEmbeddings(texts) {
+    const cacheKey = texts.join('|||');
 
-
+    // Check cache first
+    if (this.embeddingCache.has(cacheKey)) {
+      console.log('✅ Using cached embeddings');
+      return this.embeddingCache.get(cacheKey);
+    }
 
     try {
-      const response = await axios.post('https://api.jina.ai/v1/embeddings', {
-        model: 'jina-embeddings-v2-base-en',
-        input: texts
-      }, {
-        headers: {
-          'Authorization': `Bearer ${this.jinaApiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      console.log("Embeddings generated successfully");
+      const batchSize = 10; // Smaller batches for better performance
+      const embeddings = [];
 
-      return response.data.data.map(item => item.embedding);
+      for (let i = 0; i < texts.length; i += batchSize) {
+        const batch = texts.slice(i, i + batchSize);
+
+        const response = await this.axiosInstance.post('https://api.jina.ai/v1/embeddings', {
+          model: 'jina-embeddings-v2-base-en',
+          input: batch
+        });
+
+        const batchEmbeddings = response.data.data.map(item => item.embedding);
+        embeddings.push(...batchEmbeddings);
+
+        // Small delay between batches
+        if (i + batchSize < texts.length) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }
+
+      // Cache result
+      if (this.embeddingCache.size >= this.maxCacheSize) {
+        const firstKey = this.embeddingCache.keys().next().value;
+        this.embeddingCache.delete(firstKey);
+      }
+      this.embeddingCache.set(cacheKey, embeddings);
+
+      console.log("✅ Embeddings generated and cached");
+      return embeddings;
     } catch (error) {
-      console.error('Error generating embeddings:', error);
-      // Fallback to mock embeddings for testing
+      console.error('❌ Embedding generation error:', error.message);
+      // Fallback to mock embeddings
       return texts.map(() => Array(768).fill(0).map(() => Math.random()));
     }
   }
 
   async ingestNews() {
-    console.log('Starting news ingestion...');
+    console.log('🔄 Starting news ingestion...');
+    const startTime = Date.now();
 
     const articles = await this.scrapeNews();
-    console.log(`Scraped ${articles.length} articles`);
+    console.log(`📰 Scraped ${articles.length} articles`);
 
-    const texts = articles.map(article => `${article.title}\n${article.content}`);
+    const texts = articles.map(article => `${article.title}\n${article.content.substring(0, 500)}`); // Limit content
     const embeddings = await this.generateEmbeddings(texts);
 
     const points = articles.map((article, index) => ({
@@ -203,7 +260,7 @@ class NewsIngestionService {
       vector: embeddings[index],
       payload: {
         title: article.title,
-        content: article.content,
+        content: article.content.substring(0, 1000), // Limit stored content
         url: article.url,
         publishedAt: article.publishedAt.toISOString(),
         source: article.source
@@ -215,27 +272,41 @@ class NewsIngestionService {
       points: points
     });
 
-    console.log(`Stored ${points.length} articles in vector DB`);
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ Stored ${points.length} articles in ${totalTime}ms`);
     return articles.length;
   }
 
+  // Optimized similarity search
   async searchSimilar(query, limit = 5) {
-    const queryEmbedding = await this.generateEmbeddings([query]);
+    const startTime = Date.now();
 
-    const searchResult = await qdrantClient.search(this.collectionName, {
-      vector: queryEmbedding[0],
-      limit: limit,
-      with_payload: true
-    });
+    try {
+      const queryEmbedding = await this.generateEmbeddings([query]);
+      console.log(`🔍 Query embedding: ${Date.now() - startTime}ms`);
 
-    return searchResult.map(result => ({
-      score: result.score,
-      ...result.payload
-    }));
+      const searchStart = Date.now();
+      const searchResult = await qdrantClient.search(this.collectionName, {
+        vector: queryEmbedding[0],
+        limit: limit,
+        with_payload: true,
+        score_threshold: 0.2 // Filter out irrelevant results
+      });
+
+      console.log(`🔍 Vector search: ${Date.now() - searchStart}ms`);
+
+      return searchResult.map(result => ({
+        score: result.score,
+        ...result.payload
+      }));
+    } catch (error) {
+      console.error('❌ Search error:', error.message);
+      return [];
+    }
   }
 }
 
-// Session Management Service
+// Optimized Session Management Service
 class SessionService {
   constructor(redisClient) {
     this.redis = redisClient;
@@ -251,7 +322,6 @@ class SessionService {
     });
 
     await this.redis.expire(sessionKey, 3600 * 24); // 24 hours TTL
-
     return sessionId;
   }
 
@@ -263,21 +333,24 @@ class SessionService {
     const message = {
       id: messageId,
       role,
-      content,
+      content: content.substring(0, 2000), // Limit message length
       timestamp: new Date().toISOString()
     };
 
-    await this.redis.lPush(messagesKey, JSON.stringify(message));
-    await this.redis.hIncrBy(sessionKey, 'message_count', 1);
-    await this.redis.expire(messagesKey, 3600 * 24);
+    // Use pipeline for better performance
+    const pipeline = this.redis.multi();
+    pipeline.lPush(messagesKey, JSON.stringify(message));
+    pipeline.hIncrBy(sessionKey, 'message_count', 1);
+    pipeline.expire(messagesKey, 3600 * 24);
+    pipeline.expire(sessionKey, 3600 * 24);
 
+    await pipeline.exec();
     return message;
   }
 
-  async getSessionHistory(sessionId, limit = 50) {
+  async getSessionHistory(sessionId, limit = 10) {
     const messagesKey = `messages:${sessionId}`;
     const messages = await this.redis.lRange(messagesKey, 0, limit - 1);
-
     return messages.map(msg => JSON.parse(msg)).reverse();
   }
 
@@ -285,8 +358,10 @@ class SessionService {
     const sessionKey = `session:${sessionId}`;
     const messagesKey = `messages:${sessionId}`;
 
-    await this.redis.del(messagesKey);
-    await this.redis.hSet(sessionKey, 'message_count', '0');
+    const pipeline = this.redis.multi();
+    pipeline.del(messagesKey);
+    pipeline.hSet(sessionKey, 'message_count', '0');
+    await pipeline.exec();
 
     return true;
   }
@@ -298,105 +373,178 @@ class SessionService {
 
   async getAllSessions() {
     try {
-      // Get all session keys
       const sessionKeys = await this.redis.keys('session:*');
       const sessions = [];
 
-      for (const sessionKey of sessionKeys) {
-        const sessionId = sessionKey.replace('session:', '');
-        const sessionData = await this.redis.hGetAll(sessionKey);
+      // Process sessions in parallel with limit
+      const batchSize = 10;
+      for (let i = 0; i < sessionKeys.length; i += batchSize) {
+        const batch = sessionKeys.slice(i, i + batchSize);
 
-        if (sessionData.created_at) {
-          // Get recent messages for this session
-          const recentMessages = await this.getSessionHistory(sessionId, 3);
-          const lastMessage = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null;
+        const batchPromises = batch.map(async (sessionKey) => {
+          const sessionId = sessionKey.replace('session:', '');
+          const sessionData = await this.redis.hGetAll(sessionKey);
 
-          sessions.push({
-            sessionId,
-            title: lastMessage ? lastMessage.content.substring(0, 50) + '...' : 'New chat',
-            messageCount: parseInt(sessionData.message_count) || 0,
-            lastMessage: lastMessage ? lastMessage.content : 'No messages yet',
-            timestamp: lastMessage ? lastMessage.timestamp : sessionData.created_at
-          });
-        }
+          if (sessionData.created_at) {
+            const recentMessages = await this.getSessionHistory(sessionId, 2);
+            const lastMessage = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null;
+
+            return {
+              sessionId,
+              title: lastMessage ? lastMessage.content.substring(0, 50) + '...' : 'New chat',
+              messageCount: parseInt(sessionData.message_count) || 0,
+              lastMessage: lastMessage ? lastMessage.content.substring(0, 100) + '...' : 'No messages yet',
+              timestamp: lastMessage ? lastMessage.timestamp : sessionData.created_at
+            };
+          }
+          return null;
+        });
+
+        const batchResults = await Promise.allSettled(batchPromises);
+        batchResults.forEach(result => {
+          if (result.status === 'fulfilled' && result.value) {
+            sessions.push(result.value);
+          }
+        });
       }
 
-      // Sort by timestamp (most recent first)
-      sessions.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
-      return sessions;
+      return sessions.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
     } catch (error) {
-      console.error('Error getting all sessions:', error);
+      console.error('❌ Error getting all sessions:', error);
       return [];
     }
   }
 }
 
-// Chat Service
+// Optimized Chat Service
 class ChatService {
   constructor(newsService, sessionService, geminiModel) {
     this.newsService = newsService;
     this.sessionService = sessionService;
     this.model = geminiModel;
+    this.responseCache = new Map();
+    this.maxCacheSize = 50;
   }
 
+  // MAIN OPTIMIZATION: Parallel operations and reduced context
   async processQuery(sessionId, userMessage) {
-    // Retrieve relevant news passages
-    const relevantNews = await this.newsService.searchSimilar(userMessage, 3);
-
-    // Get recent chat history for context
-    const history = await this.sessionService.getSessionHistory(sessionId, 10);
-
-    // Build context for Gemini
-    const newsContext = relevantNews.map(news =>
-      `[${news.source} - ${news.publishedAt}] ${news.title}\n${news.content}`
-    ).join('\n\n');
-
-    const conversationHistory = history.slice(-5).map(msg =>
-      `${msg.role}: ${msg.content}`
-    ).join('\n');
-
-    const prompt = `
-You are a helpful news assistant. Answer the user's question based on the following recent news articles and conversation history.
-
-Recent News Articles:
-${newsContext}
-
-Recent Conversation:
-${conversationHistory}
-
-User Question: ${userMessage}
-
-Instructions:
-- Provide accurate information based on the news articles
-- If the question can't be answered from the articles, say so clearly
-- Be concise but informative
-- Cite sources when relevant
-- Maintain conversation context
-
-Answer:`;
+    const startTime = Date.now();
 
     try {
-      const result = await this.model.generateContent(prompt);
-      const response = result.response.text();
+      // 🚀 OPTIMIZATION 1: Run operations in parallel
+      const [relevantNews, history] = await Promise.all([
+        this.newsService.searchSimilar(userMessage, 3),
+        this.sessionService.getSessionHistory(sessionId, 4) // Reduced from 10 to 4
+      ]);
 
-      // Store both user message and bot response
-      await this.sessionService.addMessage(sessionId, 'user', userMessage);
-      await this.sessionService.addMessage(sessionId, 'bot', response);
+      console.log(`⚡ Parallel fetch: ${Date.now() - startTime}ms`);
+
+      // 🚀 OPTIMIZATION 2: Build optimized context
+      const newsContext = this.buildOptimizedNewsContext(relevantNews);
+      const conversationHistory = this.buildOptimizedHistory(history);
+      const prompt = this.buildOptimizedPrompt(newsContext, conversationHistory, userMessage);
+
+      const geminiStart = Date.now();
+
+      // 🚀 OPTIMIZATION 3: Generate response with timeout and retry
+      const response = await this.generateResponseWithTimeout(prompt);
+
+      console.log(`🤖 Gemini: ${Date.now() - geminiStart}ms`);
+
+      // 🚀 OPTIMIZATION 4: Store messages asynchronously (non-blocking)
+      this.storeMessagesAsync(sessionId, userMessage, response);
+
+      const totalTime = Date.now() - startTime;
+      console.log(`✅ Total processing: ${totalTime}ms`);
 
       return {
         role: 'bot',
         content: response,
-        sources: relevantNews.map(news => ({
-          title: news.title,
-          url: news.url,
-          source: news.source
-        }))
+        sources: this.extractOptimizedSources(relevantNews),
+        processingTime: totalTime
       };
     } catch (error) {
-      console.error('Error generating response:', error);
+      console.error('❌ Query processing error:', error.message);
       throw new Error('Failed to generate response');
     }
+  }
+
+  // Optimized context builders
+  buildOptimizedNewsContext(relevantNews) {
+    if (!relevantNews.length) return 'No recent news found.';
+
+    return relevantNews.map(news => {
+      const date = new Date(news.publishedAt).toLocaleDateString();
+      return `[${news.source} - ${date}]\n${news.title}\n${news.content.substring(0, 300)}...`; // Reduced from 500 to 300
+    }).join('\n\n');
+  }
+
+  buildOptimizedHistory(history) {
+    if (!history.length) return 'No conversation history.';
+
+    return history.slice(-3).map(msg => // Only last 3 messages
+      `${msg.role}: ${msg.content.substring(0, 150)}...` // Reduced from 200 to 150
+    ).join('\n');
+  }
+
+  buildOptimizedPrompt(newsContext, conversationHistory, userMessage) {
+    return `You are a concise news assistant. Answer based on the provided articles and context.
+
+Recent News:
+${newsContext}
+
+Context:
+${conversationHistory}
+
+User: ${userMessage}
+
+Provide a focused, accurate answer (max 200 words):`;
+  }
+
+  // Response generation with timeout and retry
+  async generateResponseWithTimeout(prompt, maxRetries = 2) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Gemini API timeout')), 10000) // 10 second timeout
+        );
+
+        const generatePromise = this.model.generateContent(prompt);
+        const result = await Promise.race([generatePromise, timeoutPromise]);
+
+        return result.response.text();
+
+      } catch (error) {
+        console.warn(`⚠️  Attempt ${attempt} failed: ${error.message}`);
+        if (attempt === maxRetries) {
+          throw new Error('Failed after retries: ' + error.message);
+        }
+
+        // Exponential backoff
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+    }
+  }
+
+  // Non-blocking message storage
+  async storeMessagesAsync(sessionId, userMessage, response) {
+    try {
+      await Promise.all([
+        this.sessionService.addMessage(sessionId, 'user', userMessage),
+        this.sessionService.addMessage(sessionId, 'bot', response)
+      ]);
+    } catch (error) {
+      console.error('⚠️  Message storage error (non-blocking):', error.message);
+    }
+  }
+
+  extractOptimizedSources(relevantNews) {
+    return relevantNews.map(news => ({
+      title: news.title,
+      url: news.url,
+      source: news.source,
+      score: Math.round(news.score * 100) / 100 // Round score
+    }));
   }
 }
 
@@ -412,22 +560,20 @@ app.post('/api/session', async (req, res) => {
   try {
     const sessionId = await sessionService.createSession();
 
-    // Optional: Store in PostgreSQL
+    // Optional PostgreSQL storage (non-blocking)
     if (process.env.ENABLE_POSTGRES === 'true') {
-      await pool.query(
-        'INSERT INTO sessions (id, created_at) VALUES ($1, NOW())',
-        [sessionId]
-      );
+      pool.query('INSERT INTO sessions (id, created_at) VALUES ($1, NOW())', [sessionId])
+        .catch(err => console.error('PostgreSQL insert error:', err));
     }
 
     res.json({ sessionId });
   } catch (error) {
-    console.error('Error creating session:', error);
+    console.error('❌ Session creation error:', error);
     res.status(500).json({ error: 'Failed to create session' });
   }
 });
 
-// Process user query
+// Process user query (MAIN OPTIMIZED ENDPOINT)
 app.post('/api/query', async (req, res) => {
   try {
     const { sessionId, message } = req.body;
@@ -441,24 +587,20 @@ app.post('/api/query', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const startTime = Date.now();
     const response = await chatService.processQuery(sessionId, message);
-    const processingTime = Date.now() - startTime;
 
-    console.log(`Query processed in ${processingTime}ms`);
-
-    // Optional: Store in PostgreSQL
+    // Optional PostgreSQL storage (non-blocking)
     if (process.env.ENABLE_POSTGRES === 'true') {
-      await pool.query(
+      pool.query(
         'INSERT INTO messages (id, session_id, role, content) VALUES ($1, $2, $3, $4), ($5, $6, $7, $8)',
         [uuidv4(), sessionId, 'user', message, uuidv4(), sessionId, 'bot', response.content]
-      );
+      ).catch(err => console.error('PostgreSQL message insert error:', err));
     }
 
     res.json(response);
   } catch (error) {
-    console.error('Error processing query:', error);
-    res.status(500).json({ error: 'Failed to process query' });
+    console.error('❌ Query processing error:', error);
+    res.status(500).json({ error: error.message || 'Failed to process query' });
   }
 });
 
@@ -475,7 +617,7 @@ app.get('/api/session/:id', async (req, res) => {
     const history = await sessionService.getSessionHistory(sessionId);
     res.json({ sessionId, messages: history });
   } catch (error) {
-    console.error('Error fetching session:', error);
+  
     res.status(500).json({ error: 'Failed to fetch session' });
   }
 });
@@ -497,18 +639,19 @@ app.post('/api/session/reset', async (req, res) => {
     await sessionService.resetSession(sessionId);
     res.json({ success: true, message: 'Session reset successfully' });
   } catch (error) {
-    console.error('Error resetting session:', error);
+ 
     res.status(500).json({ error: 'Failed to reset session' });
   }
 });
 
-// Get chat history (all sessions with recent messages)
+// Get chat history (optimized)
 app.get('/api/chat-history', async (req, res) => {
   try {
+
     const sessions = await sessionService.getAllSessions();
-    res.json({ sessions });
+    res.json({ sessions});
   } catch (error) {
-    console.error('Error fetching chat history:', error);
+
     res.status(500).json({ error: 'Failed to fetch chat history' });
   }
 });
@@ -519,61 +662,118 @@ app.post('/api/admin/ingest', async (req, res) => {
     const count = await newsService.ingestNews();
     res.json({ success: true, articlesIngested: count });
   } catch (error) {
-    console.error('Error ingesting news:', error);
+    console.error('❌ News ingestion error:', error);
     res.status(500).json({ error: 'Failed to ingest news' });
   }
 });
 
-// Health check
+// Health check with detailed status
 app.get('/health', async (req, res) => {
   try {
-    await redis.ping();
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+    const checks = await Promise.allSettled([
+      redis.ping(),
+      process.env.ENABLE_POSTGRES === 'true' ? pool.query('SELECT 1') : Promise.resolve(),
+      qdrantClient.getCollections()
+    ]);
+
+    const redisStatus = checks[0].status === 'fulfilled' ? 'healthy' : 'unhealthy';
+    const postgresStatus = checks[1].status === 'fulfilled' ? 'healthy' : 'unhealthy';
+    const qdrantStatus = checks[2].status === 'fulfilled' ? 'healthy' : 'unhealthy';
+
+    const overall = (redisStatus === 'healthy' && qdrantStatus === 'healthy') ? 'healthy' : 'degraded';
+
+    res.status(overall === 'healthy' ? 200 : 503).json({
+      status: overall,
+      services: {
+        redis: redisStatus,
+        postgres: process.env.ENABLE_POSTGRES === 'true' ? postgresStatus : 'disabled',
+        qdrant: qdrantStatus
+      },
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    });
   } catch (error) {
-    res.status(503).json({ status: 'unhealthy', error: error.message });
+    res.status(503).json({
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
 // Initialize and start server
 async function startServer() {
   try {
+    console.log('🚀 Starting optimized server...');
+
     // Connect to Redis
     await redis.connect();
-    console.log('Connected to Redis');
+    console.log('✅ Connected to Redis');
 
     // Initialize vector DB
     await newsService.initializeVectorDB();
+    console.log('✅ Vector DB initialized');
 
     // Test PostgreSQL connection (optional)
     if (process.env.ENABLE_POSTGRES === 'true') {
       await pool.query('SELECT NOW()');
-      console.log('Connected to PostgreSQL');
+      console.log('✅ Connected to PostgreSQL');
     }
 
     // Start server
     app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log('Available endpoints:');
-      console.log('POST /api/session - Create new session');
-      console.log('POST /api/query - Process user query');
-      console.log('GET /api/session/:id - Get session history');
-      console.log('POST /api/session/reset - Reset session');
-      console.log('POST /api/admin/ingest - Trigger news ingestion');
-      console.log('GET /health - Health check');
+      console.log(`🎉 Server running on port ${PORT}`);
+      console.log('📋 Available endpoints:');
+      console.log('   POST /api/session - Create new session');
+      console.log('   POST /api/query - Process user query (OPTIMIZED)');
+      console.log('   GET  /api/session/:id - Get session history');
+      console.log('   POST /api/session/reset - Reset session');
+      console.log('   GET  /api/chat-history - Get all sessions');
+      console.log('   POST /api/admin/ingest - Trigger news ingestion');
+      console.log('   GET  /health - Health check');
+      
     });
 
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  console.log('Shutting down gracefully...');
-  await redis.quit();
-  await pool.end();
+  console.log('🔄 Shutting down gracefully...');
+  try {
+    await redis.quit();
+    await pool.end();
+    console.log('✅ Cleanup completed');
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+  }
   process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🔄 Received SIGINT, shutting down...');
+  try {
+    await redis.quit();
+    await pool.end();
+    console.log('✅ Cleanup completed');
+  } catch (error) {
+    console.error('❌ Cleanup error:', error);
+  }
+  process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('💥 Uncaught Exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
 });
 
 startServer();
