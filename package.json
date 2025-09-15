@@ -3,32 +3,41 @@
   "version": "1.0.0",
   "description": "AI-powered chat backend with news article grounding",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "ingest": "node src/scripts/ingest-news.js",
-    "setup-db": "node src/scripts/setup-database.js",
-    "test-api": "node src/scripts/test-api.js",
+    "dev": "nodemon src/server2.js",
+    "ingest": "node scripts/ingest-news.js",
+    "setup-db": "node scripts/setup-database.js",
+    "test-api": "node scripts/test-api.js",
     "test": "jest"
   },
-  "keywords": ["ai", "chat", "news", "embeddings", "gemini"],
+  "keywords": [
+    "ai",
+    "chat",
+    "news",
+    "embeddings",
+    "gemini"
+  ],
   "author": "prince",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "uuid": "^9.0.1",
-    "redis": "^4.6.10",
-    "pg": "^8.11.3",
-    "axios": "^1.6.2",
-    "cheerio": "^1.0.0-rc.12",
     "@google/generative-ai": "^0.2.1",
     "@qdrant/js-client-rest": "^1.7.0",
-    "dotenv": "^16.3.1"
+    "@upstash/redis": "^1.35.3",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "redis": "^4.6.10",
+    "uuid": "^9.0.1",
+    "winston": "^3.17.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2",
     "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
     "supertest": "^6.3.3"
   },
   "engines": {

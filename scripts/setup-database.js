@@ -1,6 +1,8 @@
 // scripts/setup-database.js
-const { Pool } = require('pg');
-require('dotenv').config();
+import pkg from 'pg';
+const { Pool } = pkg;
+import dotenv from 'dotenv';
+dotenv.config();
 
 async function setupDatabase() {
   const pool = new Pool({
@@ -9,7 +11,7 @@ async function setupDatabase() {
 
   try {
     console.log('Setting up database schema...');
-    
+
     // Create sessions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -39,7 +41,7 @@ async function setupDatabase() {
     `);
 
     console.log('Database schema created successfully!');
-    
+
   } catch (error) {
     console.error('Error setting up database:', error);
     process.exit(1);

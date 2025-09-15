@@ -1,62 +1,39 @@
 version: '3.8'
 
 services:
-  # Main application
   app:
     build: .
     ports:
-      - "3000:3001"
+      - "3001:3001"
     environment:
-      - NODE_ENV=development
-      - REDIS_URL=redis://redis:6379
-      - DATABASE_URL=postgresql://newsai:password@postgres:5432/newsai
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-      - ENABLE_POSTGRES=true
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - JINA_API_KEY=${JINA_API_KEY}
-      - PORT=3001
-    depends_on:
-      - redis
-      - postgres
-      - qdrant
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3001}
+
+      # External services
+      REDIS_URL: ${REDIS_URL}
+      REDIS_TOKEN: ${REDIS_TOKEN}   # Upstash needs both
+      DATABASE_URL: ${DATABASE_URL}
+      ENABLE_POSTGRES: ${ENABLE_POSTGRES:-true}
+      QDRANT_HOST: ${QDRANT_HOST}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}   # for cloud Qdrant auth
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      JINA_API_KEY: ${JINA_API_KEY}
+      USE_EXTERNAL_SERVICES: ${USE_EXTERNAL_SERVICES:-true}
+
+    env_file:
+      - .env
+
     volumes:
       - .:/app
       - /app/node_modules
+
     command: npm run dev
 
-  # Redis for session management
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+    restart: unless-stopped
 
-  # PostgreSQL for persistent storage
-  postgres:
-    image: postgres:15-alpine
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=newsai
-      - POSTGRES_USER=newsai
-      - POSTGRES_PASSWORD=password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-  # Qdrant vector database
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
-
-volumes:
-  redis_data:
-  postgres_data:
-  qdrant_data:
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http=require('http');const options={hostname:'localhost',port:3001,path:'/health',timeout:3000};const req=http.request(options,res=>{process.exit(res.statusCode===200?0:1)});req.on('error',()=>process.exit(1));req.end();"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

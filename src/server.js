@@ -1,15 +1,15 @@
-// server.js - Main Express server
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const Redis = require('redis');
+const { createClient } = require('redis');
 const { Pool } = require('pg');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { QdrantClient } = require('@qdrant/js-client-rest');
-require('dotenv').config();
+const dotenv = require('dotenv');
 
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,9 +19,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // Initialize services
-const redis = Redis.createClient({
+const redis = createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379'
 });
+
+redis.on('error', (err) => console.log('Redis Client Error', err));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://newsai:password@localhost:5432/newsai'
@@ -31,8 +33,8 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 const qdrantClient = new QdrantClient({
-  host: process.env.QDRANT_HOST || 'localhost',
-  port: process.env.QDRANT_PORT || 6333
+  url: `https://${process.env.QDRANT_HOST}`,  // Use full https URL
+  apiKey: process.env.QDRANT_API_KEY,        // Pass your API key
 });
 
 // News Ingestion and Embedding Service
@@ -45,14 +47,26 @@ class NewsIngestionService {
   async initializeVectorDB() {
     try {
       await qdrantClient.createCollection(this.collectionName, {
-        vectors: { size: 768, distance: 'Cosine' }
+        vectors: { size: 768, distance: 'Cosine' },
+        // Declare payload schema so Qdrant knows what fields to index
+        on_disk_payload: true,
+        sparse_vectors: {},
+        optimizers_config: { default_segment_number: 2 },
+        hnsw_config: { m: 16, ef_construct: 100 },
+        // <---- important
+        payload_schema: {
+          category: { type: 'keyword' },
+          source: { type: 'keyword' },
+          publishedAt: { type: 'datetime' }
+        }
       });
       console.log('Vector collection created successfully');
     } catch (error) {
-      // Check for conflict status (409) or error message containing 'already exists'
-      if (error.status === 409 ||
+      if (
+        error.status === 409 ||
         error.message?.includes('already exists') ||
-        error.data?.status?.error?.includes('already exists')) {
+        error.data?.status?.error?.includes('already exists')
+      ) {
         console.log('Vector collection already exists');
       } else {
         throw error;
@@ -61,105 +75,211 @@ class NewsIngestionService {
   }
 
 
-
   async scrapeNews() {
-    const rssSources = [
-      // 🌍 World / International News
-      'https://feeds.bbci.co.uk/news/world/rss.xml',
-      'https://rss.cnn.com/rss/edition_world.rss',
-      'https://feeds.reuters.com/reuters/worldNews',
-      'https://www.aljazeera.com/xml/rss/all.xml',
-      'https://www.theguardian.com/world/rss',
-      'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
+    const rssSources = {
+      // 🌍 World / International News (limit per category)
+      world: [
+        'https://feeds.bbci.co.uk/news/world/rss.xml',
+        'https://rss.cnn.com/rss/edition_world.rss',
+        'https://feeds.reuters.com/reuters/worldNews',
+        'https://www.theguardian.com/world/rss',
+        'https://rss.nytimes.com/services/xml/rss/nyt/World.xml'
+      ],
 
       // 🏛 Politics
-      'https://feeds.bbci.co.uk/news/politics/rss.xml',
-      'https://rss.cnn.com/rss/cnn_allpolitics.rss',
-      'https://www.theguardian.com/politics/rss',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',
-      'https://www.politico.com/rss/politics08.xml',
+      politics: [
+        'https://feeds.bbci.co.uk/news/politics/rss.xml',
+        'https://rss.cnn.com/rss/cnn_allpolitics.rss',
+        'https://www.theguardian.com/politics/rss',
+        'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml'
+      ],
 
       // 💻 Technology
-      'https://www.theverge.com/rss/index.xml',
-      'https://feeds.arstechnica.com/arstechnica/index',
-      'https://www.engadget.com/rss.xml',
-      'https://techcrunch.com/feed/',
-      'https://www.wired.com/feed/rss',
-      'https://www.cnet.com/rss/news/',
-      'https://thenextweb.com/feed/',
-      'https://www.zdnet.com/news/rss.xml',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml',
+      technology: [
+        'https://www.theverge.com/rss/index.xml',
+        'https://feeds.arstechnica.com/arstechnica/index',
+        'https://www.engadget.com/rss.xml',
+        'https://techcrunch.com/feed/',
+        'https://www.wired.com/feed/rss',
+        'https://thenextweb.com/feed/',
+        'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml'
+      ],
 
       // 💹 Business / Finance
-      'https://feeds.reuters.com/reuters/businessNews',
-      'https://www.cnbc.com/id/100003114/device/rss/rss.html',
-      'https://www.economist.com/latest/rss.xml',
-      'https://www.forbes.com/business/feed2/',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
-      'https://www.ft.com/?format=rss',
-      'https://www.bloomberg.com/feed/podcast/businessweek.xml',
+      business: [
+        'https://feeds.reuters.com/reuters/businessNews',
+        'https://www.cnbc.com/id/100003114/device/rss/rss.html',
+        'https://www.forbes.com/real-time/feed2/',
+        'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml'
+      ],
 
       // 🏟 Sports
-      'https://www.espn.com/espn/rss/news',
-      'https://www.skysports.com/rss/12040',
-      'https://www.bbc.com/sport/rss.xml',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml',
-      'https://www.cbssports.com/rss/headlines/',
-
-      // ✈ Travel
-      'https://www.nationalgeographic.com/content/nationalgeographic/en_us/travel.rss',
-      'https://www.lonelyplanet.com/news.rss',
-      'https://rss.nytimes.com/services/xml/rss/nyt/Travel.xml',
-      'https://feeds.bbci.co.uk/news/world/asia/rss.xml', // has travel-style stories too
+      sports: [
+        'https://www.espn.com/espn/rss/news',
+        'https://feeds.bbci.co.uk/sport/rss.xml',
+        'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml'
+      ],
 
       // 🪙 Crypto / Blockchain
-      'https://cointelegraph.com/rss',
-      'https://news.bitcoin.com/feed/',
-      'https://decrypt.co/feed',
-      'https://www.coindesk.com/arc/outboundfeeds/rss/',
+      crypto: [
+        'https://cointelegraph.com/rss',
+        'https://www.coindesk.com/arc/outboundfeeds/rss/',
+        'https://decrypt.co/feed'
+      ],
 
-      // 🤖 Artificial Intelligence
-      'https://spectrum.ieee.org/artificial-intelligence/fulltext/rss',
-      'https://www.technologyreview.com/feed/', // MIT Tech Review (AI heavy)
-      'https://venturebeat.com/category/ai/feed/',
-      'https://towardsdatascience.com/feed'
-    ];
+      // 🤖 AI / Science
+      ai_science: [
+        'https://www.technologyreview.com/feed/',
+        'https://venturebeat.com/category/ai/feed/',
+        'https://feeds.feedburner.com/oreilly/radar'
+      ]
+    };
 
     const articles = [];
+    const articlesPerCategory = 15; // Ensure balanced coverage
+    const maxTotalArticles = 200; // Increased total limit
 
-    for (const rssUrl of rssSources) {
-      if (articles.length >= 100) break; // increase limit for more categories
+    for (const [category, urls] of Object.entries(rssSources)) {
+      console.log(`Scraping ${category} news...`);
+      let categoryCount = 0;
 
-      try {
-        const response = await axios.get(rssUrl, {
-          headers: { 'Accept': 'application/rss+xml, application/xml' }
-        });
+      for (const rssUrl of urls) {
+        if (categoryCount >= articlesPerCategory || articles.length >= maxTotalArticles) {
+          break;
+        }
 
-        const $ = cheerio.load(response.data, { xmlMode: true });
+        try {
+          console.log(`Fetching: ${rssUrl}`);
+          const response = await axios.get(rssUrl, {
+            headers: {
+              'Accept': 'application/rss+xml, application/xml, text/xml',
+              'User-Agent': 'NewsAI-Bot/1.0'
+            },
+            timeout: 10000 // 10 second timeout
+          });
 
-        $('item').each((i, item) => {
-          if (articles.length < 100) {
-            const title = $(item).find('title').text();
-            const description = $(item).find('description').text();
-            const link = $(item).find('link').text();
-            const pubDate = $(item).find('pubDate').text();
+          const $ = cheerio.load(response.data, { xmlMode: true });
 
-            articles.push({
-              id: uuidv4(),
-              title: title.trim(),
-              content: description.trim(),
-              url: link.trim(),
-              publishedAt: pubDate ? new Date(pubDate) : new Date(),
-              source: new URL(rssUrl).hostname
-            });
-          }
-        });
-      } catch (error) {
-        console.error(`Error scraping ${rssUrl}:`, error.message);
+          // Handle both 'item' and 'entry' tags (RSS vs Atom feeds)
+          const items = $('item, entry');
+          console.log(`Found ${items.length} items in ${rssUrl}`);
+
+          items.each((i, item) => {
+            if (categoryCount < articlesPerCategory && articles.length < maxTotalArticles) {
+              const $item = $(item);
+
+              // Handle both RSS and Atom formats
+              const title = $item.find('title').text().trim();
+              const description = $item.find('description, summary, content').first().text().trim();
+              const link = $item.find('link').text().trim() || $item.find('link').attr('href');
+              const pubDate = $item.find('pubDate, published, updated').first().text().trim();
+
+              // Only add articles with substantial content
+              if (title && title.length > 10 && description && description.length > 50) {
+                const article = {
+                  id: uuidv4(),
+                  title: title,
+                  content: description,
+                  url: link,
+                  publishedAt: pubDate ? new Date(pubDate) : new Date(),
+                  source: new URL(rssUrl).hostname,
+                  category: category
+                };
+
+                articles.push(article);
+                categoryCount++;
+
+                console.log(`Added article: ${title.substring(0, 50)}... (Category: ${category})`);
+              }
+            }
+          });
+
+        } catch (error) {
+          console.error(`Error scraping ${rssUrl}:`, error.message);
+          continue; // Continue with next source instead of failing
+        }
       }
+
+      console.log(`Category ${category}: ${categoryCount} articles added`);
     }
 
+    // Log category distribution
+    const categoryStats = articles.reduce((stats, article) => {
+      stats[article.category] = (stats[article.category] || 0) + 1;
+      return stats;
+    }, {});
+
+    console.log('Articles by category:', categoryStats);
+    console.log(`Total articles scraped: ${articles.length}`);
+
     return articles;
+  }
+
+  // Also update the ingestNews method to provide better logging
+  async ingestNews() {
+    console.log('Starting news ingestion...');
+
+    const articles = await this.scrapeNews();
+
+    if (articles.length === 0) {
+      console.warn('No articles were scraped!');
+      return 0;
+    }
+
+    console.log(`Scraped ${articles.length} articles`);
+
+    // Filter out articles with insufficient content
+    const validArticles = articles.filter(article =>
+      article.title && article.title.length > 10 &&
+      article.content && article.content.length > 50
+    );
+
+    console.log(`${validArticles.length} articles have sufficient content for embedding`);
+
+    if (validArticles.length === 0) {
+      console.warn('No valid articles for embedding!');
+      return 0;
+    }
+
+    const texts = validArticles.map(article => `${article.title}\n${article.content}`);
+
+    try {
+      const embeddings = await this.generateEmbeddings(texts);
+
+      const points = validArticles.map((article, index) => ({
+        id: article.id,
+        vector: embeddings[index],
+        payload: {
+          title: article.title,
+          content: article.content,
+          url: article.url,
+          publishedAt: article.publishedAt.toISOString(),
+          source: article.source,
+          category: article.category // Add category to payload
+        }
+      }));
+
+      await qdrantClient.upsert(this.collectionName, {
+        wait: true,
+        points: points
+      });
+
+      console.log(`Successfully stored ${points.length} articles in vector DB`);
+
+      // Log final category distribution
+      const finalStats = validArticles.reduce((stats, article) => {
+        stats[article.category] = (stats[article.category] || 0) + 1;
+        return stats;
+      }, {});
+
+      console.log('Final embedded articles by category:', finalStats);
+
+      return validArticles.length;
+
+    } catch (error) {
+      console.error('Error during embedding process:', error);
+      throw error;
+    }
   }
 
 
@@ -189,44 +309,74 @@ class NewsIngestionService {
     }
   }
 
-  async ingestNews() {
-    console.log('Starting news ingestion...');
-
-    const articles = await this.scrapeNews();
-    console.log(`Scraped ${articles.length} articles`);
-
-    const texts = articles.map(article => `${article.title}\n${article.content}`);
-    const embeddings = await this.generateEmbeddings(texts);
-
-    const points = articles.map((article, index) => ({
-      id: article.id,
-      vector: embeddings[index],
-      payload: {
-        title: article.title,
-        content: article.content,
-        url: article.url,
-        publishedAt: article.publishedAt.toISOString(),
-        source: article.source
-      }
-    }));
-
-    await qdrantClient.upsert(this.collectionName, {
-      wait: true,
-      points: points
-    });
-
-    console.log(`Stored ${points.length} articles in vector DB`);
-    return articles.length;
-  }
-
   async searchSimilar(query, limit = 5) {
     const queryEmbedding = await this.generateEmbeddings([query]);
 
-    const searchResult = await qdrantClient.search(this.collectionName, {
-      vector: queryEmbedding[0],
-      limit: limit,
-      with_payload: true
-    });
+    // Detect if this is a category-specific query
+    const queryLower = query.toLowerCase();
+    const categoryKeywords = {
+      sports: ['sport', 'sports', 'football', 'basketball', 'baseball', 'soccer', 'tennis', 'golf', 'hockey', 'olympics', 'nfl', 'nba', 'mlb', 'espn'],
+      technology: ['tech', 'technology', 'ai', 'artificial intelligence', 'computer', 'software', 'app', 'digital'],
+      politics: ['politics', 'political', 'government', 'election', 'president', 'congress', 'senate'],
+      business: ['business', 'finance', 'economy', 'stock', 'market', 'company', 'corporate'],
+      crypto: ['crypto', 'cryptocurrency', 'bitcoin', 'blockchain', 'ethereum'],
+      world: ['world', 'international', 'global', 'country', 'nation']
+    };
+
+    let targetCategory = null;
+    for (const [category, keywords] of Object.entries(categoryKeywords)) {
+      if (keywords.some(keyword => queryLower.includes(keyword))) {
+        targetCategory = category;
+        break;
+      }
+    }
+
+    let searchResult;
+
+    if (targetCategory) {
+      // First try to find articles from the specific category
+      searchResult = await qdrantClient.search(this.collectionName, {
+        vector: queryEmbedding[0],
+        limit: limit * 2, // Get more results to filter
+        with_payload: true,
+        filter: {
+          must: [
+            {
+              key: 'category',
+              match: {
+                value: targetCategory
+              }
+            }
+          ]
+        }
+      });
+
+      // If we don't get enough category-specific results, fall back to general search
+      if (searchResult.length < limit) {
+        console.log(`Only found ${searchResult.length} ${targetCategory} articles, supplementing with general search`);
+        const generalSearch = await qdrantClient.search(this.collectionName, {
+          vector: queryEmbedding[0],
+          limit: limit,
+          with_payload: true
+        });
+
+        // Combine and deduplicate results
+        const existingIds = new Set(searchResult.map(r => r.id));
+        const supplementalResults = generalSearch.filter(r => !existingIds.has(r.id));
+        searchResult = [...searchResult, ...supplementalResults].slice(0, limit);
+      } else {
+        searchResult = searchResult.slice(0, limit);
+      }
+    } else {
+      // General search if no specific category detected
+      searchResult = await qdrantClient.search(this.collectionName, {
+        vector: queryEmbedding[0],
+        limit: limit,
+        with_payload: true
+      });
+    }
+
+    console.log(`Search for "${query}" (category: ${targetCategory || 'general'}) returned ${searchResult.length} results`);
 
     return searchResult.map(result => ({
       score: result.score,
@@ -342,24 +492,44 @@ class ChatService {
 
   async processQuery(sessionId, userMessage) {
     // Retrieve relevant news passages
-    const relevantNews = await this.newsService.searchSimilar(userMessage, 3);
+    const relevantNews = await this.newsService.searchSimilar(userMessage, 5);
 
     // Get recent chat history for context
     const history = await this.sessionService.getSessionHistory(sessionId, 10);
 
+    // Check if we found relevant articles
+    if (relevantNews.length === 0) {
+      const response = "I don't have any recent news articles that match your query. Please try asking about different topics or check back later as I regularly update my news database.";
+
+      await this.sessionService.addMessage(sessionId, 'user', userMessage);
+      await this.sessionService.addMessage(sessionId, 'bot', response);
+
+      return {
+        role: 'bot',
+        content: response,
+        sources: []
+      };
+    }
+
     // Build context for Gemini
-    const newsContext = relevantNews.map(news =>
-      `[${news.source} - ${news.publishedAt}] ${news.title}\n${news.content}`
+    const newsContext = relevantNews.map((news, index) =>
+      `Article ${index + 1} [${news.source} - ${news.category?.toUpperCase() || 'NEWS'} - ${new Date(news.publishedAt).toLocaleDateString()}]:
+Title: ${news.title}
+Content: ${news.content}`
     ).join('\n\n');
 
     const conversationHistory = history.slice(-5).map(msg =>
       `${msg.role}: ${msg.content}`
     ).join('\n');
 
+    // Detect query type for better responses
+    const queryLower = userMessage.toLowerCase();
+    const isSportsQuery = ['sport', 'sports', 'football', 'basketball', 'baseball', 'soccer', 'tennis', 'golf', 'hockey', 'olympics', 'nfl', 'nba', 'mlb'].some(term => queryLower.includes(term));
+
     const prompt = `
 You are a helpful news assistant. Answer the user's question based on the following recent news articles and conversation history.
 
-Recent News Articles:
+Recent News Articles (${relevantNews.length} articles found):
 ${newsContext}
 
 Recent Conversation:
@@ -368,11 +538,14 @@ ${conversationHistory}
 User Question: ${userMessage}
 
 Instructions:
-- Provide accurate information based on the news articles
-- If the question can't be answered from the articles, say so clearly
-- Be concise but informative
-- Cite sources when relevant
-- Maintain conversation context
+- Provide accurate information based ONLY on the news articles provided above
+- If you found relevant articles, use them to answer the question thoroughly
+- ${isSportsQuery ? 'Focus on sports-related content and provide detailed sports information' : 'Provide comprehensive coverage of the topic'}
+- Be specific and cite information from the articles
+- If the articles don't fully answer the question, mention what information is available
+- Include relevant details like dates, sources, and key facts
+- Be engaging and informative
+- Always mention the category of news (e.g., SPORTS, TECH, POLITICS) when relevant
 
 Answer:`;
 
@@ -390,7 +563,8 @@ Answer:`;
         sources: relevantNews.map(news => ({
           title: news.title,
           url: news.url,
-          source: news.source
+          source: news.source,
+          category: news.category
         }))
       };
     } catch (error) {
